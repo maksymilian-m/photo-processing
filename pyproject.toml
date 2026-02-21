@@ -1,0 +1,26 @@
+[project]
+name = "photo-processing"
+version = "0.1.0"
+description = "A local-first Python utility toolset for photo manipulation and automation."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pillow>=11.0.0",
+    "pillow-heif>=0.21.0",
+]
+
+[project.scripts]
+heic-to-jpg = "photo_processing.heic_to_jpg.cli:main"
+
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
