@@ -2,13 +2,13 @@
 
 ## Overview
 
-The `heic-to-jpg` tool converts photos in **HEIC/HEIF** format (as exported from iPhone/iOS) — as well as standard **JPEG** and **PNG** files — into JPEG images. The key feature is automatic **chronological renaming**: each output file is named after the exact moment the photo was taken, derived directly from its EXIF metadata.
+The `heic-to-jpg` tool converts photos in **HEIC/HEIF** format (as exported from iPhone/iOS) — as well as standard **JPEG** and **PNG** files — into JPEG images. The key feature is automatic **chronological renaming** and **smart deduplication**: each output file is named after the exact moment the photo was taken, and identical photos (even if stored in different formats) are automatically identified and skipped to ensure only unique images end up in your collection.
 
-This makes it trivial to sort a large batch of photos by capture time, merge photos from multiple sources into a single timeline, and import them into any photo management software or album.
+This makes it trivial to sort a large batch of photos by capture time, merge photos from multiple sources into a single timeline, and import them into any photo management software or album without worrying about duplicates.
 
 ---
 
-## Naming Convention
+## Naming Convention & Deduplication
 
 Output filenames follow this pattern:
 
@@ -18,15 +18,22 @@ YYYY-MM-DD_HH-MM-SS.jpg
 
 ### Examples
 
-| Source file | EXIF DateTimeOriginal | Output filename |
-|---|---|---|
-| `IMG_4821.HEIC` | `2024:07:14 10:30:00` | `2024-07-14_10-30-00.jpg` |
-| `IMG_4822.HEIC` | `2024:07:14 10:30:00` | `2024-07-14_10-30-00_1.jpg` *(collision)* |
-| `IMG_4823.PNG` | *(none)* | `NO-DATE_IMG_4823.jpg` |
+| Source file | EXIF Date | Status | Output filename |
+|---|---|---|---|
+| `IMG_4821.HEIC` | `2024:07:14 10:30:00` | New | `2024-07-14_10-30-00.jpg` |
+| `IMG_4821_copy.JPG`| `2024:07:14 10:30:00` | **Duplicate** | *(Skipped)* |
+| `Burst_01.HEIC` | `2024:07:14 10:30:00` | Different photo | `2024-07-14_10-30-00_1.jpg` |
+| `IMG_4823.PNG` | *(none)* | New | `NO-DATE_IMG_4823.jpg` |
 
-### Collision Handling
+### Smart Collision Handling
 
-If two photos share the same capture second (burst photos, for example), a numeric suffix is appended (`_1`, `_2`, …) to keep all files unique.
+If two photos share the same capture second (burst photos, for example), the tool performs a **content fingerprinting** check:
+1. It calculates an "average hash" (fingerprint) of the new image.
+2. It compares it against the fingerprint of any existing file with that name in the target directory.
+3. If the fingerprints match, the new photo is **skipped** as a duplicate.
+4. If they differ, a numeric suffix is appended (`_1`, `_2`, …) to keep both photos.
+
+This approach ensures your target folder remains clean and free of identical images, even if you re-run the processing multiple times or have overlapping source backups.
 
 ### No-Date Fallback
 

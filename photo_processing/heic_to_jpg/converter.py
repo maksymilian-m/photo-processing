@@ -73,31 +73,50 @@ def extract_exif_datetime(image: Image.Image) -> Optional[datetime]:
     return None
 
 
+def get_image_fingerprint(image: Image.Image) -> str:
+    """Generate a stable fingerprint for an image based on its pixels.
+
+    This uses a simplified 'average hash' algorithm:
+    1. Convert to grayscale.
+    2. Resize to 8x8.
+    3. Calculate average brightness.
+    4. Generate a bit-string based on whether each pixel is above/below average.
+
+    This fingerprint is robust against different image formats and JPEG
+    compression levels, making it ideal for detecting duplicates.
+
+    Returns:
+        A 64-character string of '0's and '1's.
+    """
+    # Resize to 8x8 and convert to grayscale ('L')
+    reduced = image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
+    pixels = list(reduced.getdata())
+    avg = sum(pixels) / 64
+    return "".join("1" if p > avg else "0" for p in pixels)
+
+
 def build_output_filename(
     source_path: Path,
+    image: Image.Image,
     capture_dt: Optional[datetime],
+    target_dir: Path,
     existing_names: set[str],
-) -> str:
-    """Build a unique, filesystem-safe JPEG filename.
+) -> tuple[str, bool]:
+    """Build a unique, filesystem-safe JPEG filename and check for duplicates.
 
-    When a capture datetime is available, the filename follows the pattern::
-
-        YYYY-MM-DD_HH-MM-SS.jpg
-
-    When no date is available the original stem is kept with a prefix::
-
-        NO-DATE_<original-stem>.jpg
-
-    If the candidate name already exists in *existing_names*, a numeric suffix
-    is appended (``…_1.jpg``, ``…_2.jpg``, …) until a unique name is found.
+    If a filename collision occurs, the 'fingerprint' of the source image is
+    compared against the existing file. If they match, the image is considered
+    a duplicate and is skipped.
 
     Args:
-        source_path: Path of the source image (used as fallback stem).
+        source_path: Path of the source image.
+        image: The open PIL Image object.
         capture_dt: Parsed capture datetime, or *None*.
+        target_dir: The output directory.
         existing_names: Set of filenames already reserved in the target directory.
 
     Returns:
-        A unique filename string (including the ``.jpg`` extension).
+        A tuple of (filename, is_duplicate).
     """
     if capture_dt:
         base = capture_dt.strftime(_FILENAME_DATE_FORMAT)
@@ -105,49 +124,71 @@ def build_output_filename(
         base = f"{_NO_DATE_PREFIX}_{source_path.stem}"
 
     candidate = f"{base}.jpg"
+    
+    # Check if a file with this name already exists and if it's the same photo
+    fingerprint = None
     counter = 1
+    
     while candidate in existing_names:
+        existing_file = target_dir / candidate
+        if existing_file.exists():
+            if fingerprint is None:
+                fingerprint = get_image_fingerprint(image)
+            
+            try:
+                with Image.open(existing_file) as other:
+                    if get_image_fingerprint(other) == fingerprint:
+                        return candidate, True
+            except Exception:
+                logger.debug("Could not open existing file %s for comparison.", candidate)
+        
+        # If it's a different photo with the same timestamp, try a suffix
         candidate = f"{base}_{counter}.jpg"
         counter += 1
 
-    return candidate
+    return candidate, False
+
 
 
 def convert_image(
     source_path: Path,
     target_dir: Path,
     existing_names: set[str],
+    seen_fingerprints: set[str],
     quality: int = 95,
-) -> Path:
+) -> Path | None:
     """Convert a single image file to JPEG with a chronological filename.
 
-    The converted file is saved into *target_dir*. EXIF metadata is preserved
-    when available. The image is always converted to the ``RGB`` colour space
-    before saving (required for HEIC and some PNG files).
-
-    Args:
-        source_path: Absolute path to the source image.
-        target_dir: Absolute path to the output directory (must already exist).
-        existing_names: Mutable set of filename strings already used in
-            *target_dir*; updated in-place when a new file is written.
-        quality: JPEG quality (1–95). Defaults to 95.
+    Checks for duplicates both against the target directory and files
+    processed during the current run.
 
     Returns:
-        The :class:`Path` of the newly created JPEG file.
-
-    Raises:
-        OSError: If the file cannot be opened or written.
+        The Path of the written file, or None if skipped as a duplicate.
     """
     with Image.open(source_path) as img:
         capture_dt = extract_exif_datetime(img)
-        exif_bytes: Optional[bytes] = img.info.get("exif")
+        
+        output_name, is_duplicate = build_output_filename(
+            source_path, img, capture_dt, target_dir, existing_names
+        )
+        
+        if is_duplicate:
+            logger.info("Skipping duplicate: %s (matches %s)", source_path.name, output_name)
+            return None
 
-        output_name = build_output_filename(source_path, capture_dt, existing_names)
+        # Even if name is unique, check if we've seen this content in this run
+        fingerprint = get_image_fingerprint(img)
+        if fingerprint in seen_fingerprints:
+            logger.info("Skipping duplicate content: %s", source_path.name)
+            return None
+            
+        seen_fingerprints.add(fingerprint)
         existing_names.add(output_name)
 
         target_path = target_dir / output_name
-
         rgb_img = img.convert("RGB")
+        
+        exif_bytes: Optional[bytes] = img.info.get("exif")
         save_kwargs: dict = {"quality": quality, "optimize": True}
         if exif_bytes:
             save_kwargs["exif"] = exif_bytes
@@ -161,48 +202,48 @@ def process_directory(
     source_dir: Path,
     target_dir: Path,
     quality: int = 95,
-) -> tuple[list[Path], list[tuple[Path, Exception]]]:
+) -> tuple[list[Path], list[tuple[Path, Exception]], int]:
     """Convert all supported images in *source_dir* and save them to *target_dir*.
 
-    Args:
-        source_dir: Directory containing source images.
-        target_dir: Output directory (created automatically if absent).
-        quality: JPEG quality passed to each conversion. Defaults to 95.
-
     Returns:
-        A two-element tuple of ``(successes, failures)`` where:
-
-        - ``successes`` – list of :class:`Path` objects for written files.
-        - ``failures``  – list of ``(source_path, exception)`` pairs.
+        A three-element tuple of (successes, failures, skips).
     """
     _register_heif_opener()
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    source_files = [
+    source_files = sorted([
         f for f in source_dir.iterdir()
         if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
+    ])
 
     logger.info("Found %d supported file(s) in '%s'.", len(source_files), source_dir)
 
-    # Pre-populate reserved names from files already present in target_dir.
     existing_names: set[str] = {
         f.name for f in target_dir.iterdir() if f.is_file()
     }
+    seen_fingerprints: set[str] = set()
 
     successes: list[Path] = []
     failures: list[tuple[Path, Exception]] = []
+    skips: int = 0
 
     for source_path in source_files:
         try:
-            output_path = convert_image(source_path, target_dir, existing_names, quality)
-            logger.info("Converted: %s  →  %s", source_path.name, output_path.name)
-            successes.append(output_path)
-        except Exception as exc:  # noqa: BLE001
+            output_path = convert_image(
+                source_path, target_dir, existing_names, seen_fingerprints, quality
+            )
+            if output_path:
+                logger.info("Converted: %s  →  %s", source_path.name, output_path.name)
+                successes.append(output_path)
+            else:
+                skips += 1
+        except Exception as exc:
             logger.error("Failed to convert '%s': %s", source_path.name, exc)
             failures.append((source_path, exc))
 
     logger.info(
-        "Done. %d converted, %d failed.", len(successes), len(failures)
+        "Done. %d converted, %d skipped, %d failed.", 
+        len(successes), skips, len(failures)
     )
-    return successes, failures
+    return successes, failures, skips
+

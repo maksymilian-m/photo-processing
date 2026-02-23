@@ -75,11 +75,15 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("Source path '%s' is not a directory or does not exist.", source_dir)
         return 1
 
-    _, failures = process_directory(source_dir, target_dir, quality=args.quality)
+    successes, failures, skips = process_directory(source_dir, target_dir, quality=args.quality)
 
     if failures:
         logger.warning("%d file(s) could not be converted.", len(failures))
         return 1
+    
+    if skips:
+        logger.info("%d file(s) were skipped as duplicates.", skips)
+
 
     return 0
 
